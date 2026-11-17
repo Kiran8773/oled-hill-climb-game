@@ -1,0 +1,907 @@
+/*
+ * HILL CLIMB 32  v2  -  physics hill climber for ESP32 + SSD1306 OLED
+ *
+ * Hardware (ESP32 Dev Module):
+ *   OLED 0.96" I2C SSD1306: SDA -> GPIO21, SCL -> GPIO22, VCC -> 3V3, GND -> GND
+ *   Buttons (Connect between GPIO and GND):
+ *     UP    -> GPIO32
+ *     DOWN  -> GPIO33
+ *     LEFT  -> GPIO26
+ *     RIGHT -> GPIO27
+ *     OK    -> GPIO14
+ *   Buzzer (passive recommended): + -> GPIO25, - -> GND
+ *
+ * Libraries: "Adafruit SSD1306" + "Adafruit GFX Library"
+ */
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Preferences.h>
+
+// ---------------- pins / hardware config ----------------
+#define SCREEN_W   128
+#define SCREEN_H   64
+#define OLED_ADDR  0x3C      // try 0x3D if the screen stays blank
+#define PIN_SDA    21
+#define PIN_SCL    22
+#define PIN_BTN_UP 32
+#define PIN_BTN_DN 33
+#define PIN_BTN_LT 26
+#define PIN_BTN_RT 27
+#define PIN_BTN_OK 14
+#define PIN_BUZ    25
+#define INVERT_X   false     // true if gas/brake or left/right feel swapped
+#define INVERT_Y   false     // true if menu up/down feel swapped
+#define I2C_SPEED  400000    // try 800000 for a smoother frame rate
+
+// ---------------- global physics ----------------
+#define GRAV       90.0f
+#define ROLL_RES   0.12f     // multiplied by vehicle mass
+#define AIR_DRAG   0.05f
+#define ANG_DAMP   1.0f
+#define LIFT_V0    60.0f     // speed where lift starts
+#define LIFT_VR    80.0f     // speed range to reach full lift
+#define AIR_THRUST 0.30f     // fraction of engine force usable in the air
+#define MAX_ALT    130.0f    // soft ceiling above the ground
+
+// ---------------- structs ----------------
+struct Veh {
+  const char* name;
+  float mass, inertia;
+  float wrR, wrF;            // rear / front tyre radius
+  float dx;                  // half wheelbase
+  float dyR, dyF;            // wheel centre below car centre (rear / front)
+  float k, c;                // suspension spring / damper per wheel
+  float engine, vmax, brake;
+  float airTq;               // rotation torque in the air
+  float lift;                // 0..1 aerodynamic lift
+  uint8_t awd;               // 1 = all wheel drive
+  uint8_t shape;             // 0 jeep, 1 monster, 2 buggy, 3 tractor, 4 skyracer, 5 hippi van, 6 tank, 7 supercar
+  float bw, by0, by1;        // body half length, lower body y-range
+  float cabL, cabR, cabTop;  // cabin
+};
+
+struct Car { float x, y, vx, vy, a, w, wa; };
+
+struct MenuItem { uint8_t id; const char* label; };
+
+// ---------------- vehicles (8 total) ----------------
+const Veh vehicles[8] = {
+  // name       mass inertia wrR wrF  dx  dyR dyF   k    c    eng  vmax brk airTq lift awd shp  bw  by0 by1 cabL cabR top
+  {"JEEP",      1.0f, 200,   6,  6,  11,  4,  4,  150, 14,  115, 170,  55, 6.0f, 0.55f, 0, 0,  13, -1,  4,  -6,   8,  8},
+  {"MONSTER",   1.5f, 380,   9,  9,  13,  5,  5,  330, 30,  190, 150,  80, 4.0f, 0.40f, 1, 1,  15,  1,  6,  -6,   8, 10},
+  {"BUGGY",     0.8f, 130,   7,  6,  10,  4,  5,  130, 11,  125, 210,  50, 9.0f, 0.75f, 0, 2,  12, -1,  3,  -5,   6,  8},
+  {"TRACTOR",   1.6f, 320,   9,  5,  12,  5,  9,  300, 28,  210, 100,  70, 3.0f, 0.30f, 0, 3,  14, -2,  3, -10,  -1, 11},
+  {"SKYRACER",  0.9f, 150,   6,  6,  12,  4,  4,  140, 12,  150, 260,  55, 7.0f, 1.00f, 0, 4,  15, -1,  3,  -3,   6,  7},
+  {"HIPPI VAN", 1.2f, 260,   7,  7,  13,  5,  5,  110, 22,  160, 200,  60, 5.0f, 0.50f, 0, 5,  15, -2,  6, -10,  10, 11},
+  {"TANK",      2.0f, 480,   7,  7,  14,  5,  5,  400, 40,  280, 200,  85, 3.0f, 0.20f, 1, 6,  16, -2,  4,  -8,   8, 10},
+  {"SUPERCAR",  1.1f, 180,   5,  5,  12,  2,  2,  250, 20,  250, 350, 100, 5.0f, 1.40f, 0, 7,  16, -2,  2,  -4,   4,  6}
+};
+#define NVEH 8
+
+// ---------------- stages (3 total) ----------------
+const char* stageNames[] = {"COUNTRYSIDE", "MOUNTAIN", "HIGHWAY"};
+#define NSTAGES 3
+
+int vehIdx = 0;
+int stageIdx = 0;
+const Veh* V = &vehicles[0];
+
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
+Preferences prefs;
+
+enum State { ST_MENU, ST_VEHICLE, ST_STAGE, ST_PLAY, ST_PAUSE, ST_OVER };
+State state = ST_MENU;
+
+Car car;
+
+float camX = 0, camY = 0;
+float gasIn = 0, brk = 0;
+int   navX = 0, navY = 0;
+float fuel = 100;
+int   coins = 0;
+float distM = 0;
+uint32_t bestDist[NSTAGES] = {0, 0, 0};
+float stuckT = 0;
+bool  gameActive = false;
+bool  soundOn = true;
+const char* overReason = "";
+unsigned long lastUs = 0, sfxEnd = 0, lastNav = 0;
+int menuSel = 0;
+int lastFreq = -1;
+int lastRunVeh = 0;
+int lastRunStage = 0;
+
+// Bonus tracking variables
+float airTimer = 0;
+bool wasAir = false;
+float flipTracker = 0;
+int popupBonus = 0;
+const char* popupStr = "";
+unsigned long popupEnd = 0;
+
+#define RING 32
+int32_t coinRing[RING]; uint8_t coinHead = 0;
+int32_t fuelRing[8];    uint8_t fuelHead = 0;
+
+// ---------------- sound ----------------
+void buzzInit() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(PIN_BUZ, 2000, 8);
+#else
+  ledcSetup(0, 2000, 8);
+  ledcAttachPin(PIN_BUZ, 0);
+#endif
+}
+void buzz(int f) {
+  if (!soundOn) f = 0;
+  if (f == lastFreq) return;
+  lastFreq = f;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWriteTone(PIN_BUZ, f);
+#else
+  ledcWriteTone(0, f);
+#endif
+}
+void sfx(int f, int ms) { buzz(f); sfxEnd = millis() + ms; }
+void melody(const int* n, const int* d, int cnt) {
+  if (!soundOn) return;
+  for (int i = 0; i < cnt; i++) { buzz(n[i]); delay(d[i]); }
+  buzz(0);
+}
+
+// ---------------- helpers ----------------
+uint32_t hash32(uint32_t v) {
+  v ^= v >> 16; v *= 0x7feb352d; v ^= v >> 15; v *= 0x846ca68b; v ^= v >> 16;
+  return v;
+}
+
+float rampH(float x) {
+  float s = floorf((x - 500.0f) / 700.0f);
+  if (s < 0) return 0;
+  if (s > 0 && hash32((uint32_t)s + 777) % 3 == 0) return 0;
+  float u = x - (500.0f + s * 700.0f);
+  if (u < 0 || u >= 120.0f) return 0;
+  if (u < 80.0f) return 0.3f * u;
+  float t = (u - 80.0f) / 40.0f;
+  return 12.0f * (1.0f + cosf(t * 3.14159f));
+}
+
+// Highly accurate terrain engine generating custom stages
+float terrain(float x) {
+  float r = (x - 120.0f) / 400.0f;
+  if (r < 0) r = 0; if (r > 1) r = 1;
+  r = r * r * (3.0f - 2.0f * r);
+  float d = x / 9000.0f; if (d > 1) d = 1;
+
+  if (stageIdx == 1) { 
+    // MOUNTAIN: A-shaped steep bumps, but perfectly smoothed off at the tips
+    float amp = r * (22.0f + 25.0f * d);
+    float s1 = sinf(x * 0.008f);
+    // Hyperbolic smoothing logic: flattens the sharp tip of a triangle wave
+    float a_shape = 1.0f - sqrtf(s1 * s1 + 0.05f); 
+    float shape = a_shape * 1.8f + 0.3f * sinf(x * 0.03f) + 0.15f * sinf(x * 0.07f);
+    return 20.0f + amp * shape;
+  } 
+  else if (stageIdx == 2) { 
+    // HIGHWAY: Massive amplitude, extremely wide frequency, cubic sine terraces
+    float amp = r * (70.0f + 80.0f * d); 
+    float s1 = sinf(x * 0.0012f); 
+    float shape = (s1 * s1 * s1) * 1.4f + 0.25f * sinf(x * 0.0031f) + 0.1f * sinf(x * 0.008f);
+    return 20.0f + amp * shape; 
+  } 
+  else { 
+    // STAGE 0: COUNTRYSIDE: The original bouncy hills and ramps
+    float amp = r * (4.0f + 11.0f * d);
+    float shape = sinf(x * 0.022f) + 0.5f * sinf(x * 0.051f + 1.3f) + 0.22f * sinf(x * 0.13f + 0.6f);
+    return 20.0f + amp * shape + rampH(x);
+  }
+}
+
+bool inRing(int32_t* r, int n, int32_t v) {
+  for (int i = 0; i < n; i++) if (r[i] == v) return true;
+  return false;
+}
+
+bool coinAt(int i, float &wx, float &wy) {
+  if (i < 0) return false;
+  uint32_t h = hash32(i / 5);
+  if (h % 3 == 0) return false;
+  wx = 160.0f + i * 22.0f;
+  wy = terrain(wx) + 12.0f + (((h >> 4) & 3) == 0 ? 14.0f : 0.0f);
+  return true;
+}
+bool fuelAt(int seg, float &wx, float &wy) {
+  if (seg < 0) return false;
+  uint32_t h = hash32(seg + 9999);
+  if (h % 4 == 0) return false;
+  wx = 380.0f + seg * 600.0f + ((h >> 8) % 200);
+  wy = terrain(wx) + 12.0f + (((h >> 3) & 1) ? 10.0f : 0.0f);
+  return true;
+}
+
+inline int SX(float wx) { return (int)(wx - camX + 0.5f); }
+inline int SY(float wy) { return (int)(34.5f - (wy - camY)); }
+
+void bodyPoint(float lx, float ly, float &wx, float &wy) {
+  float ca = cosf(car.a), sa = sinf(car.a);
+  wx = car.x + lx * ca - ly * sa;
+  wy = car.y + lx * sa + ly * ca;
+}
+
+// ---------------- input ----------------
+void readInputs() {
+  bool stUp = (digitalRead(PIN_BTN_UP) == LOW);
+  bool stDn = (digitalRead(PIN_BTN_DN) == LOW);
+  bool stLt = (digitalRead(PIN_BTN_LT) == LOW);
+  bool stRt = (digitalRead(PIN_BTN_RT) == LOW);
+
+  if (INVERT_X) { bool tmp = stLt; stLt = stRt; stRt = tmp; }
+  if (INVERT_Y) { bool tmp = stUp; stUp = stDn; stDn = tmp; }
+
+  gasIn = stRt ? 1.0f : 0.0f;
+  brk   = stLt ? 1.0f : 0.0f;
+
+  navX = 0; navY = 0;
+  unsigned long t = millis();
+  
+  if (!stUp && !stDn && !stLt && !stRt) lastNav = 0;
+  
+  if (t - lastNav > 230) {
+    if (stUp)      { navY = -1; lastNav = t; }
+    else if (stDn) { navY = 1;  lastNav = t; }
+    else if (stRt) { navX = 1;  lastNav = t; }
+    else if (stLt) { navX = -1; lastNav = t; }
+  }
+}
+
+bool buttonEdge() {
+  static bool last = false;
+  static unsigned long lastT = 0;
+  bool cur = (digitalRead(PIN_BTN_OK) == LOW);
+  bool e = false;
+  if (cur && !last && millis() - lastT > 200) { e = true; lastT = millis(); }
+  last = cur;
+  return e;
+}
+
+// ---------------- game logic ----------------
+void resetGame() {
+  car.x = 20; car.y = terrain(20) + V->wrR + V->dyR + 1;
+  car.vx = car.vy = car.a = car.w = car.wa = 0;
+  fuel = 100; coins = 0; distM = 0; stuckT = 0;
+  airTimer = 0; wasAir = false; flipTracker = 0; popupBonus = 0;
+  for (int i = 0; i < RING; i++) coinRing[i] = -1;
+  for (int i = 0; i < 8; i++) fuelRing[i] = -1;
+  camX = car.x - 36; camY = car.y;
+}
+
+void physicsStep(float dt) {
+  float ca = cosf(car.a), sa = sinf(car.a);
+  float Fx = 0, Fy = 0, T = 0;
+  int contacts = 0;
+  float g = fuel > 0 ? gasIn : 0;
+
+  for (int i = 0; i < 2; i++) {
+    float lx = (i == 0) ? -V->dx : V->dx;
+    float ly = (i == 0) ? -V->dyR : -V->dyF;
+    float wr = (i == 0) ? V->wrR : V->wrF;
+    float rx = lx * ca - ly * sa;
+    float ry = lx * sa + ly * ca;
+    float wx = car.x + rx, wy = car.y + ry;
+
+    float gh = terrain(wx);
+    float s = (terrain(wx + 1.0f) - terrain(wx - 1.0f)) * 0.5f;
+    float il = 1.0f / sqrtf(1.0f + s * s);
+    float nx = -s * il, ny = il, tx = il, ty = s * il;
+
+    float pen = gh + wr - wy;
+    if (pen > -1.0f) contacts++;
+    if (pen <= 0) continue;
+
+    float wvx = car.vx - car.w * ry;
+    float wvy = car.vy + car.w * rx;
+    float vn = wvx * nx + wvy * ny;
+    float vt = wvx * tx + wvy * ty;
+
+    float Fn = V->k * pen - V->c * vn;
+    if (Fn < 0) Fn = 0;
+    if (Fn > 1500.0f * V->mass) Fn = 1500.0f * V->mass;
+
+    // Bounce bonus trigger
+    if (Fn > 300.0f * V->mass && fabsf(vt) > 20.0f) {
+      if (millis() > sfxEnd) {
+        coins += 1; 
+        sfx(1600, 30);
+      }
+    }
+
+    float Ft = 0;
+    bool driven = (i == 0) || V->awd;
+    if (g > 0 && driven && vt < V->vmax) {
+      float share = V->awd ? 0.5f : 1.0f;
+      Ft += V->engine * share * g * (1.0f - vt / V->vmax);
+    }
+    if (brk > 0) {
+      if (vt > 4.0f) Ft -= V->brake * brk;
+      else if (i == 0 && vt > -60.0f) Ft -= V->engine * 0.4f * brk;
+    }
+    Ft -= vt * ROLL_RES * V->mass;
+
+    float fx = Fn * nx + Ft * tx;
+    float fy = Fn * ny + Ft * ty;
+    Fx += fx; Fy += fy;
+    T += rx * fy - ry * fx;
+  }
+
+  float ax = Fx / V->mass - car.vx * AIR_DRAG;
+  float ay = -GRAV + Fy / V->mass;
+  float aw = T / V->inertia - car.w * ANG_DAMP;
+
+  if (contacts == 0) {
+    if (!wasAir) {
+      wasAir = true;
+      airTimer = 0;
+      flipTracker = 0; 
+    }
+    airTimer += dt;
+    flipTracker += car.w * dt;
+
+    if (fabsf(flipTracker) >= 6.28318f) {
+      if (flipTracker > 0) flipTracker -= 6.28318f;
+      else flipTracker += 6.28318f;
+
+      coins += 50;
+      popupBonus = 50;
+      popupStr = "FLIP!";
+      popupEnd = millis() + 1200;
+      if (millis() > sfxEnd) sfx(2000, 100);
+    }
+
+    aw += (g - brk) * V->airTq;
+    float sp = fabsf(car.vx);
+    float L = (sp - LIFT_V0) / LIFT_VR;
+    if (L < 0) L = 0; if (L > 1) L = 1;
+    L *= V->lift * (1.0f + 1.2f * sinf(car.a));
+    if (L < 0) L = 0; if (L > 1.1f) L = 1.1f;
+    ay += GRAV * 0.92f * L;
+
+    float th = g * V->engine * AIR_THRUST / V->mass;
+    ax += th * ca;
+    ay += th * sa;
+
+    float alt = car.y - terrain(car.x);
+    if (alt > MAX_ALT) ay -= (alt - MAX_ALT) * 3.0f;
+  } else {
+    if (wasAir && airTimer > 0.4f) {
+      int airBonus = (int)(airTimer * 25.0f);
+      coins += airBonus;
+      popupBonus = airBonus;
+      popupStr = "AIR!";
+      popupEnd = millis() + 1200;
+      sfx(2500, 100);
+    }
+    airTimer = 0;
+    wasAir = false;
+  }
+
+  car.vx += ax * dt; car.vy += ay * dt; car.w += aw * dt;
+  if (car.w > 12) car.w = 12; if (car.w < -12) car.w = -12;
+  car.x += car.vx * dt;
+  car.y += car.vy * dt;
+  car.a += car.w * dt;
+  car.wa += ((car.vx * ca + car.vy * sa) / V->wrR) * dt;
+
+  if (car.x < 12) { car.x = 12; if (car.vx < 0) car.vx = 0; }
+}
+
+void headPos(float &hx, float &hy) {
+  hx = (V->cabL + V->cabR) * 0.5f;
+  hy = V->by1 + (V->cabTop - V->by1) * 0.55f;
+}
+
+bool crashed() {
+  float hx, hy; headPos(hx, hy);
+  const float pts[3][2] = { {V->cabL + 3, V->cabTop}, {V->cabR - 3, V->cabTop}, {hx, hy} };
+  for (int i = 0; i < 3; i++) {
+    float px, py; bodyPoint(pts[i][0], pts[i][1], px, py);
+    if (py < terrain(px) + 1.0f) return true;
+  }
+  return false;
+}
+
+void pickups() {
+  int c0 = (int)floorf((car.x - 160.0f) / 22.0f);
+  for (int i = c0 - 1; i <= c0 + 1; i++) {
+    float wx, wy;
+    if (!coinAt(i, wx, wy) || inRing(coinRing, RING, i)) continue;
+    float dx = wx - car.x, dy = wy - car.y;
+    if (dx * dx + dy * dy < 160) {
+      coinRing[coinHead++ % RING] = i;
+      coins++;
+      sfx(1900, 40);
+    }
+  }
+  int s0 = (int)floorf((car.x - 380.0f) / 600.0f);
+  for (int s = s0 - 1; s <= s0 + 1; s++) {
+    float wx, wy;
+    if (!fuelAt(s, wx, wy) || inRing(fuelRing, 8, s)) continue;
+    float dx = wx - car.x, dy = wy - car.y;
+    if (dx * dx + dy * dy < 220) {
+      fuelRing[fuelHead++ % 8] = s;
+      fuel = fminf(100.0f, fuel + 40.0f);
+      sfx(1200, 60);
+    }
+  }
+}
+
+void gameOver(const char* why) {
+  overReason = why;
+  gameActive = false;
+  buzz(0);
+  uint32_t m = (uint32_t)distM;
+  if (m > bestDist[stageIdx]) { 
+    bestDist[stageIdx] = m; 
+    char key[4]; snprintf(key, sizeof(key), "b%d", stageIdx);
+    prefs.putUInt(key, bestDist[stageIdx]); 
+  }
+  if (why[0] == 'C') {
+    const int n[] = {500, 400, 300, 200};
+    const int d[] = {120, 120, 120, 250};
+    melody(n, d, 4);
+  } else {
+    const int n[] = {600, 450, 300};
+    const int d[] = {150, 150, 300};
+    melody(n, d, 3);
+  }
+  state = ST_OVER; menuSel = 0;
+}
+
+void startRun() {
+  resetGame();
+  gameActive = true;
+  lastRunVeh = vehIdx;
+  lastRunStage = stageIdx;
+  const int n[] = {800, 1000, 1300};
+  const int d[] = {80, 80, 140};
+  melody(n, d, 3);
+  state = ST_PLAY;
+  lastUs = micros();
+}
+
+// ---------------- drawing ----------------
+void drawTerrain() {
+  int prev = 0;
+  for (int sx = 0; sx < SCREEN_W; sx++) {
+    int gy = SY(terrain(camX + sx));
+    if (sx == 0) prev = gy;
+    int px = sx > 0 ? sx - 1 : 0;
+    display.drawLine(px, prev, sx, gy, WHITE);
+    display.drawLine(px, prev + 1, sx, gy + 1, WHITE);
+    for (int y = gy + 3; y < SCREEN_H; y += 3)
+      if (y >= 0 && ((sx + y) & 3) == 0) display.drawPixel(sx, y, WHITE);
+    prev = gy;
+  }
+}
+
+void drawItems() {
+  int c0 = (int)floorf((camX - 160.0f) / 22.0f) - 1;
+  for (int i = c0; i < c0 + 9; i++) {
+    float wx, wy;
+    if (!coinAt(i, wx, wy) || inRing(coinRing, RING, i)) continue;
+    int x = SX(wx), y = SY(wy);
+    if (x < -4 || x > SCREEN_W + 4) continue;
+    display.drawCircle(x, y, 2, WHITE);
+    display.drawPixel(x, y, WHITE);
+  }
+  int s0 = (int)floorf((camX - 380.0f) / 600.0f) - 1;
+  for (int s = s0; s < s0 + 3; s++) {
+    float wx, wy;
+    if (!fuelAt(s, wx, wy) || inRing(fuelRing, 8, s)) continue;
+    int x = SX(wx), y = SY(wy);
+    if (x < -6 || x > SCREEN_W + 6) continue;
+    display.drawRect(x - 3, y - 4, 7, 8, WHITE);
+    display.drawFastHLine(x - 1, y, 3, WHITE);
+    display.drawFastVLine(x, y - 2, 5, WHITE);
+  }
+}
+
+void drawWheelAt(int x, int y, int r, float wa) {
+  display.fillCircle(x, y, r + 1, BLACK);
+  display.drawCircle(x, y, r, WHITE);
+  if (r >= 6) display.drawCircle(x, y, r - 1, WHITE);
+  if (r >= 8) display.drawCircle(x, y, r - 3, WHITE);
+  if (r >= 7) display.drawCircle(x, y, 2, WHITE); else display.drawPixel(x, y, WHITE);
+  int l = r - 2;
+  int dxs = (int)lroundf(l * cosf(wa)), dys = (int)lroundf(l * sinf(wa));
+  display.drawLine(x - dxs, y - dys, x + dxs, y + dys, WHITE);
+  if (r >= 7) display.drawLine(x - dys, y + dxs, x + dys, y - dxs, WHITE);
+}
+
+void drawVehicle(const Veh* v, float cxs, float cys, float ang, float wa) {
+  float ca = cosf(ang), sa = sinf(ang);
+  auto P = [&](float lx, float ly, int &x, int &y) {
+    x = (int)lroundf(cxs + lx * ca - ly * sa);
+    y = (int)lroundf(cys - (lx * sa + ly * ca));
+  };
+  int ax, ay, bx, by, cx, cy, dx, dy;
+  P(-v->bw, v->by0, ax, ay); P(v->bw, v->by0, bx, by);
+  P(v->bw, v->by1, cx, cy);  P(-v->bw, v->by1, dx, dy);
+  display.fillTriangle(ax, ay, bx, by, cx, cy, WHITE);
+  display.fillTriangle(ax, ay, cx, cy, dx, dy, WHITE);
+
+  // cabin
+  int c0x, c0y, c1x, c1y, c2x, c2y, c3x, c3y;
+  P(v->cabL, v->by1, c0x, c0y);       P(v->cabL + 3, v->cabTop, c1x, c1y);
+  P(v->cabR - 3, v->cabTop, c2x, c2y); P(v->cabR, v->by1, c3x, c3y);
+  display.drawLine(c0x, c0y, c1x, c1y, WHITE);
+  display.drawLine(c1x, c1y, c2x, c2y, WHITE);
+  display.drawLine(c2x, c2y, c3x, c3y, WHITE);
+
+  int x1, y1, x2, y2, x3, y3;
+  if (v->shape == 1) {            // monster
+    P(v->cabL + 3, v->cabTop + 2, x1, y1); P(v->cabR - 3, v->cabTop + 2, x2, y2);
+    display.drawLine(x1, y1, x2, y2, WHITE);
+    P(v->bw + 2, v->by0, x1, y1); P(v->bw + 2, v->by1, x2, y2);
+    display.drawLine(x1, y1, x2, y2, WHITE);
+  } else if (v->shape == 3) {     // tractor
+    P(v->bw - 3, v->by1, x1, y1); P(v->bw - 3, v->by1 + 5, x2, y2);
+    display.drawLine(x1, y1, x2, y2, WHITE);
+  } else if (v->shape == 4) {     // skyracer
+    P(v->bw, v->by0, x1, y1); P(v->bw, v->by1, x2, y2); P(v->bw + 5, v->by0, x3, y3);
+    display.fillTriangle(x1, y1, x2, y2, x3, y3, WHITE);
+    P(-v->bw + 1, v->by1, x1, y1); P(-v->bw + 1, v->by1 + 5, x2, y2);
+    display.drawLine(x1, y1, x2, y2, WHITE);
+    P(-v->bw - 3, v->by1 + 5, x1, y1); P(-v->bw + 6, v->by1 + 5, x2, y2);
+    display.drawLine(x1, y1, x2, y2, WHITE);
+  } else if (v->shape == 5) {     // Hippi Van
+    P(-v->bw + 2, v->cabTop - 1, x1, y1); P(v->bw - 2, v->cabTop - 1, x2, y2);
+    display.drawLine(x1, y1, x2, y2, WHITE);
+  } else if (v->shape == 6) {     // Military Tank
+    P(0, v->cabTop, x1, y1); P(v->bw + 6, v->cabTop - 1, x2, y2);
+    display.drawLine(x1, y1, x2, y2, WHITE);
+    display.drawLine(x1, y1 - 1, x2, y2 - 1, WHITE);
+  } else if (v->shape == 7) {     // Supercar
+    P(-v->bw + 2, v->by1, x1, y1); P(-v->bw, v->by1 + 4, x2, y2);
+    display.drawLine(x1, y1, x2, y2, WHITE); 
+    P(-v->bw - 2, v->by1 + 4, x1, y1); P(-v->bw + 3, v->by1 + 4, x2, y2);
+    display.drawLine(x1, y1, x2, y2, WHITE); 
+  }
+
+  float hx = (v->cabL + v->cabR) * 0.5f;
+  float hy = v->by1 + (v->cabTop - v->by1) * 0.55f;
+  P(hx, hy, x1, y1);
+  display.fillCircle(x1, y1, 2, WHITE);
+
+  P(-v->dx, -v->dyR, x1, y1);
+  P(v->dx, -v->dyF, x2, y2);
+
+  if (v->shape == 6) { // Tank Tracks
+    for (int i = 0; i <= 3; i++) {
+      float lerp = i / 3.0f;
+      int wx = x1 + (int)((x2 - x1) * lerp);
+      int wy = y1 + (int)((y2 - y1) * lerp);
+      drawWheelAt(wx, wy, (int)v->wrR, wa);
+    }
+    float dx_w = x2 - x1, dy_w = y2 - y1;
+    float len = sqrtf(dx_w * dx_w + dy_w * dy_w);
+    if (len > 0.1f) {
+      float nx = -dy_w / len, ny = dx_w / len;
+      int ox = (int)(nx * (v->wrR + 1)), oy = (int)(ny * (v->wrR + 1));
+      display.drawLine(x1 + ox, y1 + oy, x2 + ox, y2 + oy, WHITE); 
+      display.drawLine(x1 - ox, y1 - oy, x2 - ox, y2 - oy, WHITE); 
+    }
+  } else {
+    drawWheelAt(x1, y1, (int)v->wrR, wa);
+    drawWheelAt(x2, y2, (int)v->wrF, wa * v->wrR / v->wrF);
+  }
+}
+
+void drawHUD() {
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.print((int)distM); display.print("m");
+  bool blink = fuel < 20 && ((millis() / 250) & 1);
+  display.drawRect(46, 0, 36, 6, WHITE);
+  if (!blink) display.fillRect(47, 1, (int)(34.0f * fuel / 100.0f), 4, WHITE);
+  display.setCursor(86, 0);
+  display.print("$"); display.print(coins);
+
+  if (millis() < popupEnd) {
+    display.fillRect(26, 22, 76, 16, BLACK);
+    display.drawRect(26, 22, 76, 16, WHITE);
+    display.setCursor(30, 26);
+    display.print("+"); display.print(popupBonus); display.print(" "); display.print(popupStr);
+  }
+}
+
+void drawScene() {
+  display.clearDisplay();
+  drawTerrain();
+  drawItems();
+  drawVehicle(V, car.x - camX, 34.5f - (car.y - camY), car.a, car.wa);
+  drawHUD();
+}
+
+enum { M_RESUME, M_NEW, M_VEH, M_STG, M_SND, M_RESTART, M_MAIN, M_RETRY, M_NONE = 255 };
+
+uint8_t menuStep(const struct MenuItem* it, int n, int y0, bool press) {
+  if (menuSel >= n) menuSel = 0;
+  if (navY != 0) { menuSel = (menuSel + navY + n) % n; sfx(1500, 15); }
+  display.setTextSize(1);
+  for (int i = 0; i < n; i++) {
+    int y = y0 + i * 11;
+    if (i == menuSel) {
+      display.fillRect(4, y - 2, 120, 11, WHITE);
+      display.setTextColor(BLACK);
+    } else {
+      display.setTextColor(WHITE);
+    }
+    display.setCursor(12, y);
+    display.print(it[i].label);
+  }
+  display.setTextColor(WHITE);
+  if (press) { sfx(2000, 30); return it[menuSel].id; }
+  return M_NONE;
+}
+
+void toggleSound() {
+  soundOn = !soundOn;
+  prefs.putBool("snd", soundOn);
+  if (soundOn) sfx(1800, 40);
+}
+
+void runMainMenu(bool press) {
+  static char vlabel[24], slabel[24];
+  snprintf(vlabel, sizeof(vlabel), "VEHICLE: %s", V->name);
+  snprintf(slabel, sizeof(slabel), "STAGE: %s", stageNames[stageIdx]);
+  
+  MenuItem it[5]; int n = 0;
+  if (gameActive) it[n++] = { M_RESUME, "RESUME" };
+  it[n++] = { M_NEW, "NEW GAME" };
+  it[n++] = { M_VEH, vlabel };
+  it[n++] = { M_STG, slabel };
+  it[n++] = { M_SND, soundOn ? "SOUND: ON" : "SOUND: OFF" };
+
+  display.clearDisplay();
+  display.setTextSize(1); display.setTextColor(WHITE);
+  display.setCursor(0, 0);  display.print("HILL CLIMB");
+  display.setCursor(66, 0); display.print("BEST "); display.print(bestDist[stageIdx]); display.print("m");
+  uint8_t r = menuStep(it, n, 12, press);
+  display.display();
+
+  switch (r) {
+    case M_RESUME: state = ST_PLAY; lastUs = micros(); break;
+    case M_NEW:    startRun(); break;
+    case M_VEH:    state = ST_VEHICLE; break;
+    case M_STG:    state = ST_STAGE; break;
+    case M_SND:    toggleSound(); break;
+  }
+}
+
+void runPauseMenu(bool press) {
+  const MenuItem it[4] = {
+    { M_RESUME,  "RESUME" },
+    { M_RESTART, "RESTART" },
+    { M_MAIN,    "MAIN MENU" },
+    { M_SND,     soundOn ? "SOUND: ON" : "SOUND: OFF" }
+  };
+  display.clearDisplay();
+  display.setTextSize(1); display.setTextColor(WHITE);
+  display.setCursor(0, 2); display.print("PAUSED  ");
+  display.print((int)distM); display.print("m  $"); display.print(coins);
+  uint8_t r = menuStep(it, 4, 14, press);
+  display.display();
+
+  switch (r) {
+    case M_RESUME:  state = ST_PLAY; lastUs = micros(); break;
+    case M_RESTART: startRun(); break;
+    case M_MAIN:    state = ST_MENU; menuSel = 0; break;
+    case M_SND:     toggleSound(); break;
+  }
+}
+
+void runGameOver(bool press) {
+  drawTerrain();
+  drawItems();
+  drawVehicle(V, car.x - camX, 34.5f - (car.y - camY), car.a, car.wa);
+
+  display.fillRect(10, 10, 108, 44, BLACK);
+  display.drawRect(10, 10, 108, 44, WHITE);
+  display.setTextSize(1); display.setTextColor(WHITE);
+  display.setCursor(18, 14); display.print(overReason);
+  display.setCursor(18, 26); display.print("Dist: "); display.print((int)distM); display.print("m");
+  display.setCursor(18, 36); display.print("Coins: $"); display.print(coins);
+  display.setCursor(18, 46); display.print("Best: "); display.print(bestDist[stageIdx]); display.print("m");
+  display.display();
+
+  if (press) {
+    sfx(2000, 30);
+    state = ST_MENU; 
+    menuSel = 0;
+  }
+}
+
+void runVehicleSelect(bool press) {
+  if (navX != 0) {
+    vehIdx = (vehIdx + navX + NVEH) % NVEH;
+    V = &vehicles[vehIdx];
+    sfx(1400, 15);
+  }
+  display.clearDisplay();
+  display.setTextSize(1); display.setTextColor(WHITE);
+
+  char head[24];
+  snprintf(head, sizeof(head), "< %s >", V->name);
+  int len = strlen(head);
+  display.setCursor((SCREEN_W - len * 6) / 2, 0);
+  display.print(head);
+
+  float cys = 40.0f - (V->wrR + V->dyR);
+  display.drawFastHLine(0, 41, SCREEN_W, WHITE);
+  drawVehicle(V, 64, cys, 0, millis() * 0.004f);
+
+  float pwr = fminf(1.0f, (V->engine / V->mass) / 170.0f);
+  float spd = fminf(1.0f, V->vmax / 260.0f);
+  float air = V->lift;
+  const char* lab[3] = { "PWR", "SPD", "AIR" };
+  float val[3] = { pwr, spd, air };
+  for (int i = 0; i < 3; i++) {
+    int y = 45 + i * 6;
+    display.setCursor(0, y); display.print(lab[i]);
+    display.drawRect(24, y, 100, 6, WHITE);
+    display.fillRect(25, y + 1, (int)(98.0f * val[i]), 4, WHITE);
+  }
+  display.display();
+
+  if (press) {
+    sfx(2000, 30);
+    prefs.putUChar("veh", vehIdx);
+    if (gameActive && vehIdx != lastRunVeh) gameActive = false;
+    state = ST_MENU; menuSel = 0;
+  }
+}
+
+void runStageSelect(bool press) {
+  if (navX != 0) {
+    stageIdx = (stageIdx + navX + NSTAGES) % NSTAGES;
+    sfx(1400, 15);
+  }
+  display.clearDisplay();
+  display.setTextSize(1); display.setTextColor(WHITE);
+
+  char head[32];
+  snprintf(head, sizeof(head), "< %s >", stageNames[stageIdx]);
+  int len = strlen(head);
+  display.setCursor((SCREEN_W - len * 6) / 2, 0);
+  display.print(head);
+
+  // Dynamic Live Preview of the exact terrain math!
+  int prevY = 0;
+  for (int sx = 0; sx < SCREEN_W; sx++) {
+     float realX = 1600.0f + sx * 6.0f; 
+     int gy = 40 - (int)(terrain(realX) * 0.18f); 
+     
+     if (gy < 10) gy = 10;
+     if (gy > 50) gy = 50;
+     
+     if (sx == 0) prevY = gy;
+     display.drawLine(sx > 0 ? sx - 1 : 0, prevY, sx, gy, WHITE);
+     for (int y = gy + 2; y < 52; y += 3) {
+        if (((sx + y) & 3) == 0) display.drawPixel(sx, y, WHITE); 
+     }
+     prevY = gy;
+  }
+  display.drawFastHLine(0, 52, SCREEN_W, WHITE); 
+
+  display.setCursor(0, 56);
+  display.print("BEST: "); display.print(bestDist[stageIdx]); display.print("m");
+  display.display();
+
+  if (press) {
+    sfx(2000, 30);
+    prefs.putUChar("stg", stageIdx);
+    if (gameActive && stageIdx != lastRunStage) gameActive = false;
+    state = ST_MENU; menuSel = 0;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(PIN_BTN_UP, INPUT_PULLUP);
+  pinMode(PIN_BTN_DN, INPUT_PULLUP);
+  pinMode(PIN_BTN_LT, INPUT_PULLUP);
+  pinMode(PIN_BTN_RT, INPUT_PULLUP);
+  pinMode(PIN_BTN_OK, INPUT_PULLUP);
+  
+  buzzInit();
+
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(I2C_SPEED);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("SSD1306 not found - check wiring / address");
+    for (;;) delay(1000);
+  }
+  display.clearDisplay();
+  display.display();
+
+  prefs.begin("hc32", false);
+  for (int i=0; i<NSTAGES; i++) {
+    char key[4]; snprintf(key, sizeof(key), "b%d", i);
+    bestDist[i] = prefs.getUInt(key, 0);
+  }
+  
+  vehIdx   = prefs.getUChar("veh", 0);
+  stageIdx = prefs.getUChar("stg", 0);
+  if (vehIdx < 0 || vehIdx >= NVEH) vehIdx = 0;
+  if (stageIdx < 0 || stageIdx >= NSTAGES) stageIdx = 0;
+  
+  soundOn = prefs.getBool("snd", true);
+  V = &vehicles[vehIdx];
+  lastRunVeh = vehIdx;
+  lastRunStage = stageIdx;
+
+  resetGame();
+  lastUs = micros();
+}
+
+void loop() {
+  unsigned long now = micros();
+  float dt = (now - lastUs) / 1000000.0f;
+  lastUs = now;
+  if (dt > 0.05f) dt = 0.05f;
+  if (dt <= 0) dt = 0.001f;
+
+  bool press = buttonEdge();
+  readInputs();
+
+  if (state != ST_PLAY && state != ST_OVER && millis() > sfxEnd) buzz(0);
+
+  switch (state) {
+    case ST_MENU:    runMainMenu(press);     break;
+    case ST_VEHICLE: runVehicleSelect(press); break;
+    case ST_STAGE:   runStageSelect(press);   break;
+    case ST_PAUSE:   runPauseMenu(press);    break;
+    case ST_OVER:    runGameOver(press);     break;
+
+    case ST_PLAY: {
+      if (press) { state = ST_PAUSE; menuSel = 0; buzz(0); break; }
+
+      int steps = (int)ceilf(dt / 0.004f);
+      if (steps < 1) steps = 1;
+      float h = dt / steps;
+      for (int i = 0; i < steps; i++) physicsStep(h);
+
+      float g = fuel > 0 ? gasIn : 0;
+      fuel -= (1.5f + 2.0f * g) * dt;
+      if (fuel < 0) fuel = 0;
+
+      pickups();
+
+      float m = (car.x - 20.0f) / 8.0f;
+      if (m > distM) distM = m;
+
+      float tx = car.x - 36.0f + car.vx * 0.12f;
+      camX += (tx - camX) * fminf(1.0f, 6.0f * dt);
+      camY += (car.y - camY) * fminf(1.0f, 3.0f * dt);
+
+      drawScene();
+      display.display();
+
+      if (millis() > sfxEnd) {
+        if (g > 0.05f) buzz(70 + (int)(fabsf(car.vx) * 0.9f) + (int)(g * 40));
+        else buzz(0);
+      }
+
+      if (crashed()) { gameOver("CRASHED!"); break; }
+      if (fuel <= 0 && fabsf(car.vx) < 4.0f) {
+        stuckT += dt;
+        if (stuckT > 1.5f) gameOver("OUT OF FUEL");
+      } else stuckT = 0;
+      break;
+    }
+  }
+}
