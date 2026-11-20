@@ -1,4 +1,4 @@
-# oled-hill-climb-game
+# esp32-oled-hill-climb-game
 ESP32 controlled hill climb racing game on 0.96inch oled display.
 # Hill Climb 32 v2
 A physics-based 2D hill climber game built for the ESP32 and a 0.96" SSD1306 OLED display. The repository includes two code versions to support playing with either analog joystick module or 5 push buttons.
